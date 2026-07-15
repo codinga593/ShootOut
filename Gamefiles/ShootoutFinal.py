@@ -1,8 +1,8 @@
-import pygame, random, math, os, sys, time, threading, socket, json, uuid
+import asyncio, pygame, random, math, os, sys, time, threading, socket, json, uuid
 from dataclasses import dataclass
 
 # Server and Game Config
-SERVER_HOST, SERVER_PORT = "0.0.0.0", 50007
+SERVER_HOST, SERVER_PORT = "127.0.0.1", 50007
 MAP_W, MAP_H = 7000, 4000
 SCREEN_W, SCREEN_H = 1280, 800
 FPS = 60
@@ -15,20 +15,43 @@ BOT_SHOOT_COOLDOWN, BOT_VIEW_RANGE = 1.1, 700
 OBSTACLE_COUNT, CHEST_COUNT, POWERUP_COUNT = 120, 46, 30
 MAX_WEAPON_SLOTS, MAX_MEDKITS = 2, 3
 MEDKIT_HEAL, MEDKIT_USE_TIME = 50, 1.8
+MULTIPLAYER_SPAWN_CLEAR_RADIUS = 300
 
 
-# Colors definitions
-WHITE, BLACK, RED, GREEN = (240,240,240), (10,10,10), (220,40,40), (40,200,40)
-YELLOW, BLUE, GRAY, PURPLE = (220,200,40), (60,140,220), (120,120,120), (180,40,180)
-ORANGE, CYAN, PINK = (255,165,0), (0, 0, 139), (255,20,147)
+# Visual palette
+WHITE, BLACK = (244, 247, 242), (10, 15, 18)
+RED, GREEN = (239, 83, 80), (74, 222, 128)
+YELLOW, BLUE = (250, 204, 74), (73, 145, 255)
+GRAY, PURPLE = (128, 143, 151), (168, 112, 255)
+ORANGE, CYAN, PINK = (255, 153, 74), (74, 207, 217), (245, 99, 171)
+INK, PANEL, PANEL_SOFT = (16, 25, 30), (20, 31, 37), (30, 45, 52)
+GROUND, GROUND_LINE = (72, 125, 82), (80, 138, 91)
+OBSTACLE, OBSTACLE_EDGE = (66, 76, 78), (42, 51, 54)
 
 # Assets and Music intialization for background sounds
 ASSET_DIR = os.path.join(os.path.dirname(__file__), "zombs_assets_v3")
-SOUND_DIR = os.path.join(ASSET_DIR, "sounds")
-pygame.mixer.init()
-pygame.mixer.music.load("background.mp3")
-pygame.mixer.music.set_volume(0.7)
-pygame.mixer.music.play(-1)
+SOUND_DIR = os.path.join(ASSET_DIR, "Sounds")
+BACKGROUND_MUSIC = os.path.join(os.path.dirname(__file__), "background.mp3")
+IS_WEB = sys.platform == "emscripten"
+
+
+def start_background_music():
+    """Start audio after Pygame/browser initialization and fail gracefully."""
+    if IS_WEB:
+        # Autoplay rejection in browsers can surface as a modal promise error
+        # that steals input from the Pygame canvas. Effects still work after
+        # the player's first interaction.
+        return
+    try:
+        if not pygame.mixer.get_init():
+            pygame.mixer.init()
+        if not pygame.mixer.music.get_busy():
+            pygame.mixer.music.load(BACKGROUND_MUSIC)
+            pygame.mixer.music.set_volume(0.7)
+            pygame.mixer.music.play(-1)
+    except (pygame.error, OSError):
+        # Browsers may withhold audio until the player interacts with the page.
+        pass
 
 #Functions required
 def clamp(v,a,b): 
@@ -99,7 +122,8 @@ class RemotePlayer(Entity):
         self.id = pid
         self.name = name
         self.angle = 0.0
-        self.color = (200, 200, 0)  # yellowish to stand out
+        accents = (YELLOW, CYAN, PINK, ORANGE, PURPLE, GREEN)
+        self.color = accents[sum(ord(ch) for ch in str(pid)) % len(accents)]
 
 #Player Class
 class Player(Entity):
@@ -287,17 +311,169 @@ class NetworkClient:
             except: 
                 pass
 
+    def poll(self):
+        # Desktop networking delivers messages on its receive thread.
+        return
+
+
+class BrowserWebSocketClient:
+    """Reliable browser WebSocket transport with a JavaScript message queue."""
+
+    def __init__(self, player_id, name="Player", auto_join=True):
+        self.player_id, self.name = player_id, name
+        self.auto_join = auto_join
+        self.socket = None
+        self._platform = None
+        self._bridge_key = f"shootout_ws_{uuid.uuid4().hex}"
+        self.running = self.connected = False
+        self.on_message = None
+        self.last_error = ""
+        self._last_connect_attempt = 0.0
+
+    def connect(self):
+        try:
+            import platform
+
+            location = platform.window.location
+            protocol = "wss:" if str(location.protocol) == "https:" else "ws:"
+            self._platform = platform
+            self.running = True
+            return self._open_socket(f"{protocol}//{location.host}/ws")
+        except Exception as exc:
+            self.last_error = str(exc)
+            self.running = self.connected = False
+            print(f"WebSocket connection error: {exc}")
+            return False
+
+    def _open_socket(self, url=None):
+        try:
+            if url is None:
+                location = self._platform.window.location
+                protocol = "wss:" if str(location.protocol) == "https:" else "ws:"
+                url = f"{protocol}//{location.host}/ws"
+            self._last_connect_attempt = time.monotonic()
+            initial_message = (
+                {"type": "join", "id": self.player_id, "name": self.name}
+                if self.auto_join else {"type": "ping"}
+            )
+            self._platform.window.eval(
+                f"""
+                (() => {{
+                    window.__shootoutSockets = window.__shootoutSockets || {{}};
+                    const key = {json.dumps(self._bridge_key)};
+                    const previous = window.__shootoutSockets[key];
+                    if (previous?.socket?.readyState <= WebSocket.OPEN) {{
+                        previous.socket.close();
+                    }}
+                    const entry = {{socket: null, queue: [], error: ""}};
+                    const socket = new WebSocket({json.dumps(url)});
+                    entry.socket = socket;
+                    window.__shootoutSockets[key] = entry;
+                    socket.addEventListener('open', () => {{
+                        entry.error = "";
+                        socket.send({json.dumps(json.dumps(initial_message))});
+                    }});
+                    socket.addEventListener('message', (event) => {{
+                        try {{
+                            entry.queue.push(JSON.parse(String(event.data)));
+                        }} catch (_) {{
+                            entry.error = "Invalid server message";
+                        }}
+                    }});
+                    socket.addEventListener('error', () => {{
+                        entry.error = "Unable to reach multiplayer server";
+                    }});
+                }})()
+                """
+            )
+            self.socket = True
+            self.connected = False
+            return True
+        except Exception as exc:
+            self.last_error = str(exc)
+            self.socket = self.connected = False
+            return False
+
+    def poll(self):
+        if not self.running or not self.socket or not self._platform:
+            return
+        try:
+            key = json.dumps(self._bridge_key)
+            raw = self._platform.window.eval(
+                f"""
+                JSON.stringify((() => {{
+                    const entry = window.__shootoutSockets?.[{key}];
+                    if (!entry) return {{state: WebSocket.CLOSED, error: "", messages: []}};
+                    return {{
+                        state: entry.socket.readyState,
+                        error: entry.error || "",
+                        messages: entry.queue.splice(0)
+                    }};
+                }})())
+                """
+            )
+            snapshot = json.loads(str(raw))
+            state = int(snapshot.get("state", 3))
+            self.connected = state == 1
+            if self.connected:
+                self.last_error = ""
+            elif snapshot.get("error"):
+                self.last_error = snapshot["error"]
+
+            for message in snapshot.get("messages", []):
+                if self.on_message:
+                    self.on_message(message)
+
+            if state in (2, 3) and time.monotonic() - self._last_connect_attempt >= 2.5:
+                self.last_error = "Reconnecting..."
+                self._open_socket()
+        except Exception as exc:
+            self.connected = False
+            self.last_error = str(exc)
+
+    def send(self, obj):
+        if not self.connected or not self.socket:
+            return
+        try:
+            payload = json.dumps(obj)
+            self._platform.window.eval(
+                "window.__shootoutSockets["
+                + json.dumps(self._bridge_key)
+                + "]?.socket?.send("
+                + json.dumps(payload)
+                + ")"
+            )
+        except Exception as exc:
+            self.last_error = str(exc)
+            self.connected = False
+
+    def close(self):
+        self.running = self.connected = False
+        if self.socket and self._platform:
+            try:
+                self._platform.window.eval(
+                    "(() => { const key = "
+                    + json.dumps(self._bridge_key)
+                    + "; window.__shootoutSockets?.[key]?.socket?.close();"
+                    + " if (window.__shootoutSockets) delete window.__shootoutSockets[key]; })()"
+                )
+            except Exception:
+                pass
+        self.socket = None
+
 #Singleplayer and Multiplayer Game Loop
 class Game:
     def __init__(self, multiplayer=False):
         pygame.init()
         self.screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
-        pygame.display.set_caption(f"Zombs v3 ({'Multiplayer' if multiplayer else 'Singleplayer'})")
+        pygame.display.set_caption(f"ShootOut ({'Multiplayer' if multiplayer else 'Singleplayer'})")
         self.clock = pygame.time.Clock()
         
         # Fonts
-        self.font = pygame.font.SysFont("Consolas", 18)
-        self.bigfont = pygame.font.SysFont("Consolas", 72)
+        self.font = pygame.font.SysFont("Arial", 18)
+        self.smallfont = pygame.font.SysFont("Arial", 14)
+        self.mediumfont = pygame.font.SysFont("Arial", 24, bold=True)
+        self.bigfont = pygame.font.SysFont("Arial", 72, bold=True)
         
         # Game objects
         self.camera = pygame.Rect(0, 0, SCREEN_W, SCREEN_H)
@@ -317,6 +493,9 @@ class Game:
         self.remote_players = {}
         self.lobby_players = {}
         self.is_host = False
+        self.network_spawned = not multiplayer
+        self.network_player_count = 1
+        self.last_state_sent = 0.0
         
         # Generate world
         self._spawn_world()
@@ -391,11 +570,20 @@ class Game:
 
         # --- Obstacles ---
         rng = DeterministicRandom(obstacle_seed)
+        spawn_clear_rect = pygame.Rect(
+            MAP_W // 2 - MULTIPLAYER_SPAWN_CLEAR_RADIUS,
+            MAP_H // 2 - MULTIPLAYER_SPAWN_CLEAR_RADIUS,
+            MULTIPLAYER_SPAWN_CLEAR_RADIUS * 2,
+            MULTIPLAYER_SPAWN_CLEAR_RADIUS * 2,
+        )
         for _ in range(OBSTACLE_COUNT):
             w, h = rng.randint(120, 420), rng.randint(80, 420)
             x, y = rng.randint(60, MAP_W - w - 60), rng.randint(60, MAP_H - h - 60)
-            if not pygame.Rect(x, y, w, h).collidepoint(MAP_W / 2, MAP_H / 2):
-                self.obstacles.append(pygame.Rect(x, y, w, h))
+            obstacle = pygame.Rect(x, y, w, h)
+            if self.multiplayer and obstacle.colliderect(spawn_clear_rect):
+                continue
+            if not obstacle.collidepoint(MAP_W / 2, MAP_H / 2):
+                self.obstacles.append(obstacle)
 
         # --- Chests ---
         rng = DeterministicRandom(chest_seed)
@@ -446,7 +634,10 @@ class Game:
         return False
 
     def connect_to_server(self):
-        self.net_client = NetworkClient(SERVER_HOST, SERVER_PORT, self.player_id)
+        if IS_WEB:
+            self.net_client = BrowserWebSocketClient(self.player_id)
+        else:
+            self.net_client = NetworkClient(SERVER_HOST, SERVER_PORT, self.player_id)
         self.net_client.on_message = self._handle_network_message
         return self.net_client.connect()
 
@@ -457,23 +648,51 @@ class Game:
         if msg_type == "join":
             pid = msg.get("id")
             self.lobby_players[pid] = msg.get("name", "Player")
+            self.network_player_count = max(1, len(self.remote_players) + 2)
         elif msg_type == "leave":
             pid = msg.get("id")
             self.lobby_players.pop(pid, None)
             self.remote_players.pop(pid, None)
+            self.network_player_count = max(1, len(self.remote_players) + 1)
         elif msg_type == "start":
             self.victory = False
             self.start_time = time.time()
+            self.network_player_count = max(1, int(msg.get("players", 1)))
         if msg_type == "roster":
+            roster_ids = set()
             for p in msg.get("players", []):
                 pid, name = p["id"], p["name"]
-                if pid != self.player_id and pid not in self.remote_players:
-                    self.remote_players[pid] = RemotePlayer(pid, name)
+                roster_ids.add(pid)
+                self.lobby_players[pid] = name
+                if pid == self.player_id:
+                    # Apply the authoritative safe spawn only on the first join.
+                    if not self.network_spawned:
+                        self.player.x = float(p.get("x", self.player.x))
+                        self.player.y = float(p.get("y", self.player.y))
+                    self.player.hp = float(p.get("hp", self.player.hp))
+                    self.network_spawned = True
+                else:
+                    rp = self.remote_players.get(pid)
+                    if rp is None:
+                        rp = RemotePlayer(pid, name, p.get("x", MAP_W/2), p.get("y", MAP_H/2))
+                        self.remote_players[pid] = rp
+                    rp.name = name
+                    rp.x, rp.y = float(p.get("x", rp.x)), float(p.get("y", rp.y))
+                    rp.vx, rp.vy = float(p.get("vx", 0)), float(p.get("vy", 0))
+                    rp.angle = float(p.get("angle", 0))
+                    rp.hp = float(p.get("hp", PLAYER_MAX_HP))
+                    rp.dead = bool(p.get("dead", False))
+            for pid in list(self.remote_players):
+                if pid not in roster_ids:
+                    self.remote_players.pop(pid, None)
+            self.network_player_count = max(1, len(roster_ids))
 
         elif msg_type == "join":
             pid, name = msg.get("id"), msg.get("name", "Player")
             if pid != self.player_id:
-                self.remote_players[pid] = RemotePlayer(pid, name)
+                self.remote_players[pid] = RemotePlayer(
+                    pid, name, msg.get("x", MAP_W/2), msg.get("y", MAP_H/2)
+                )
 
         elif msg_type == "leave":
             pid = msg.get("id")
@@ -481,8 +700,16 @@ class Game:
 
         elif msg_type == "state":
             pid = msg.get("id")
-            if pid in self.remote_players:
-                rp = self.remote_players[pid]
+            if pid != self.player_id:
+                rp = self.remote_players.get(pid)
+                if rp is None:
+                    rp = RemotePlayer(
+                        pid,
+                        self.lobby_players.get(pid, "Player"),
+                        msg.get("x", MAP_W/2),
+                        msg.get("y", MAP_H/2),
+                    )
+                    self.remote_players[pid] = rp
                 rp.x, rp.y = msg["x"], msg["y"]
                 rp.vx, rp.vy = msg["vx"], msg["vy"]
                 rp.angle, rp.hp = msg["angle"], msg["hp"]
@@ -526,6 +753,9 @@ class Game:
     #Update stored stats
                 
     def update(self, dt):
+        if self.multiplayer and self.net_client:
+            self.net_client.poll()
+
         # Handle input
         keys = pygame.key.get_pressed()
         mx, my = pygame.mouse.get_pos()
@@ -559,7 +789,14 @@ class Game:
         self._move_entity(self.player, dt)
         self.player.angle = math.atan2(world_my - self.player.y, world_mx - self.player.x)
         # Multiplayer sync
-        if self.multiplayer and self.net_client and self.net_client.connected:
+        now = time.monotonic()
+        if (
+            self.multiplayer
+            and self.network_spawned
+            and self.net_client
+            and self.net_client.connected
+            and now - self.last_state_sent >= 1 / 20
+        ):
             self.net_client.send({
                 "type": "state",
                 "id": self.player_id,
@@ -568,6 +805,7 @@ class Game:
                 "angle": self.player.angle,
                 "hp": self.player.hp
             })
+            self.last_state_sent = now
         # Shooting
         self.player.last_shot += dt
         if (self.mouse_down or keys[pygame.K_SPACE]):
@@ -810,14 +1048,26 @@ class Game:
                 return
 
     def draw(self):
-        # Clear screen
-        self.screen.fill((92, 150, 82))
+        # Subtle world grid gives movement a clearer sense of speed and scale.
+        self.screen.fill(GROUND)
+        grid = 96
+        start_x = -int(self.camera.x) % grid
+        start_y = -int(self.camera.y) % grid
+        for x in range(start_x, SCREEN_W, grid):
+            pygame.draw.line(self.screen, GROUND_LINE, (x, 0), (x, SCREEN_H), 1)
+        for y in range(start_y, SCREEN_H, grid):
+            pygame.draw.line(self.screen, GROUND_LINE, (0, y), (SCREEN_W, y), 1)
         
         # Draw obstacles
         for obs in self.obstacles:
             rect = pygame.Rect(obs.x - self.camera.x, obs.y - self.camera.y, obs.width, obs.height)
-            pygame.draw.rect(self.screen, (90,90,90), rect)
-            pygame.draw.rect(self.screen, (60,60,60), rect, 2)
+            pygame.draw.rect(self.screen, (37, 55, 49), rect.move(6, 8), border_radius=8)
+            pygame.draw.rect(self.screen, OBSTACLE, rect, border_radius=8)
+            pygame.draw.rect(self.screen, OBSTACLE_EDGE, rect, 3, border_radius=8)
+            pygame.draw.line(
+                self.screen, (90, 104, 101), (rect.left + 8, rect.top + 7),
+                (rect.right - 8, rect.top + 7), 2
+            )
         
         # Draw chests
         for chest in self.chests:
@@ -837,6 +1087,8 @@ class Game:
             ptype = POWERUP_TYPES[powerup['type']]
             x = int(powerup['x'] - self.camera.x)
             y = int(powerup['y'] - self.camera.y + math.sin(powerup['bob']) * 4)
+            glow = tuple((c + g) // 2 for c, g in zip(ptype['color'], GROUND))
+            pygame.draw.circle(self.screen, glow, (x, y), 22)
             pygame.draw.circle(self.screen, ptype['color'], (x, y), 15)
             pygame.draw.circle(self.screen, WHITE, (x, y), 15, 2)
             # Draw icon letter
@@ -870,14 +1122,27 @@ class Game:
             if rp.dead: 
                 continue
             rx, ry = int(rp.x - self.camera.x), int(rp.y - self.camera.y)
+            pygame.draw.circle(self.screen, (20, 30, 28), (rx, ry + 4), rp.r + 5)
+            pygame.draw.circle(self.screen, WHITE, (rx, ry), rp.r + 5, 2)
             pygame.draw.circle(self.screen, rp.color, (rx, ry), rp.r)
             # direction line
             ax = rx + math.cos(rp.angle) * (rp.r + 12)
             ay = ry + math.sin(rp.angle) * (rp.r + 12)
             pygame.draw.line(self.screen, (250,250,100), (rx, ry), (ax, ay), 3)
             # name tag
-            name_surf = self.font.render(rp.name, True, WHITE)
-            self.screen.blit(name_surf, (rx - name_surf.get_width()//2, ry - rp.r - 18))
+            name_surf = self.smallfont.render(rp.name, True, WHITE)
+            tag_rect = pygame.Rect(0, 0, name_surf.get_width() + 16, 22)
+            tag_rect.center = (rx, ry - rp.r - 18)
+            pygame.draw.rect(self.screen, PANEL, tag_rect, border_radius=11)
+            pygame.draw.rect(self.screen, rp.color, tag_rect, 2, border_radius=11)
+            self.screen.blit(name_surf, name_surf.get_rect(center=tag_rect.center))
+            hp_width = 42
+            pygame.draw.rect(self.screen, PANEL, (rx - hp_width//2, ry + rp.r + 8, hp_width, 5), border_radius=3)
+            pygame.draw.rect(
+                self.screen, GREEN,
+                (rx - hp_width//2, ry + rp.r + 8, int(hp_width * clamp(rp.hp / PLAYER_MAX_HP, 0, 1)), 5),
+                border_radius=3,
+            )
             
         # Player color based on powerups
         player_color = BLUE
@@ -890,6 +1155,7 @@ class Game:
         
         if 'player' in self.assets:
             img = self.assets['player']
+            pygame.draw.circle(self.screen, BLUE, (px, py), self.player.r + 9, 3)
             self.screen.blit(img, (px - img.get_width()//2, py - img.get_height()//2))
         else:
             pygame.draw.circle(self.screen, player_color, (px, py), self.player.r)
@@ -908,6 +1174,15 @@ class Game:
         ax = px + math.cos(self.player.angle) * (self.player.r + 12)
         ay = py + math.sin(self.player.angle) * (self.player.r + 12)
         pygame.draw.line(self.screen, (220,220,220), (px, py), (ax, ay), 4)
+        you_text = self.smallfont.render("YOU", True, WHITE)
+        you_rect = pygame.Rect(0, 0, you_text.get_width() + 14, 21)
+        you_rect.center = (px, py - self.player.r - 20)
+        pygame.draw.rect(self.screen, PANEL, you_rect, border_radius=10)
+        pygame.draw.rect(self.screen, BLUE, you_rect, 2, border_radius=10)
+        self.screen.blit(you_text, you_text.get_rect(center=you_rect.center))
+
+        if self.multiplayer:
+            self._draw_teammate_indicators()
         
         # Draw UI
         self._draw_ui()
@@ -944,87 +1219,124 @@ class Game:
         
         pygame.display.flip()
 
+    def _draw_teammate_indicators(self):
+        """Keep other players discoverable even when they are off camera."""
+        margin = 46
+        for rp in self.remote_players.values():
+            if rp.dead:
+                continue
+            sx, sy = rp.x - self.camera.x, rp.y - self.camera.y
+            if -20 <= sx <= SCREEN_W + 20 and -20 <= sy <= SCREEN_H + 20:
+                continue
+            ix = int(clamp(sx, margin, SCREEN_W - margin))
+            iy = int(clamp(sy, margin, SCREEN_H - margin))
+            pygame.draw.circle(self.screen, PANEL, (ix, iy), 18)
+            pygame.draw.circle(self.screen, rp.color, (ix, iy), 18, 3)
+            dx, dy = normalize(sx - SCREEN_W / 2, sy - SCREEN_H / 2)
+            pygame.draw.line(self.screen, rp.color, (ix, iy), (ix + dx * 11, iy + dy * 11), 4)
+            distance = int(length(rp.x - self.player.x, rp.y - self.player.y) / 10)
+            label = self.smallfont.render(f"{rp.name}  {distance}m", True, WHITE)
+            label_x = int(clamp(ix - label.get_width() / 2, 8, SCREEN_W - label.get_width() - 8))
+            label_y = iy + 23 if iy < SCREEN_H / 2 else iy - 41
+            self.screen.blit(label, (label_x, label_y))
+
     def _draw_ui(self):
-        # Health
-        hp_text = self.font.render(f"HP: {int(self.player.hp)}", True, WHITE)
-        self.screen.blit(hp_text, (12, 12))
-        
-        # Weapon slots
-        slot_size = 64
-        base_x = SCREEN_W//2 - (MAX_WEAPON_SLOTS * slot_size // 2)
-        y = SCREEN_H - slot_size - 20
-        
-        for i in range(MAX_WEAPON_SLOTS):
-            x = base_x + i * slot_size
-            
-            # Slot background
-            color = (255,255,100) if i == self.player.equipped else (200,200,200)
-            pygame.draw.rect(self.screen, color, (x, y, slot_size, slot_size), 3)
-            
-            gun = self.player.inventory[i]
-            if gun:
-                # Gun icon or name
-                if gun.name in self.assets:
-                    img = self.assets[gun.name]
-                    self.screen.blit(img, (x + 4, y + 4))
-                else:
-                    gun_text = self.font.render(gun.name[0], True, BLACK)
-                    self.screen.blit(gun_text, (x + 20, y + 20))
-                
-                # Ammo count
-                ammo_text = self.font.render(f"{self.player.mag[i]}/{gun.mag}", True, WHITE)
-                self.screen.blit(ammo_text, (x + 4, y + slot_size - 16))
-            else:
-                empty_text = self.font.render("Empty", True, GRAY)
-                self.screen.blit(empty_text, (x + 8, y + 24))
-            
-            # Slot number
-            num_text = self.font.render(str(i + 1), True, WHITE)
-            self.screen.blit(num_text, (x + slot_size - 16, y + slot_size - 16))
-        
-        # Medkits
-        medkit_text = self.font.render(f"Medkits: {self.player.medkits}", True, WHITE)
-        self.screen.blit(medkit_text, (12, 36))
-        
-        # Medkit progress bar
+        # Vital stats panel
+        self._draw_panel((14, 14, 268, 92))
+        hp = int(clamp(self.player.hp, 0, PLAYER_MAX_HP))
+        hp_label = self.mediumfont.render(f"{hp}", True, WHITE)
+        self.screen.blit(hp_label, (28, 24))
+        self.screen.blit(self.smallfont.render("HEALTH", True, GRAY), (70, 31))
+        pygame.draw.rect(self.screen, INK, (28, 59, 238, 10), border_radius=5)
+        hp_color = GREEN if hp > 35 else RED
+        pygame.draw.rect(self.screen, hp_color, (28, 59, int(238 * hp / PLAYER_MAX_HP), 10), border_radius=5)
+        medkit_label = self.smallfont.render(f"Q  MEDKITS  {self.player.medkits}/{MAX_MEDKITS}", True, WHITE)
+        self.screen.blit(medkit_label, (28, 78))
+
         if self.player.is_using_medkit:
             progress = clamp(1 - (self.player.medkit_timer / MEDKIT_USE_TIME), 0, 1)
-            pygame.draw.rect(self.screen, (30,30,30), (12, 60, 200, 12))
-            pygame.draw.rect(self.screen, (100,255,100), (12, 60, int(200 * progress), 12))
-        
-        # Active powerups
-        y_offset = 90
+            pygame.draw.rect(self.screen, INK, (28, 96, 238, 7), border_radius=4)
+            pygame.draw.rect(self.screen, GREEN, (28, 96, int(238 * progress), 7), border_radius=4)
+
+        # Active effects are compact cards below the health panel.
+        y_offset = 116
         for i, powerup in enumerate(self.player.active_powerups):
             ptype = POWERUP_TYPES[powerup['type']]
-            
-            # Powerup icon
-            icon_rect = pygame.Rect(12, y_offset + i * 28, 20, 20)
-            pygame.draw.rect(self.screen, ptype['color'], icon_rect)
-            pygame.draw.rect(self.screen, WHITE, icon_rect, 2)
-            
-            # Timer bar
-            timer_progress = powerup['time_left'] / ptype['duration']
-            timer_width = 120
-            pygame.draw.rect(self.screen, (30,30,30), (40, y_offset + i * 28 + 6, timer_width, 8))
-            pygame.draw.rect(self.screen, ptype['color'], (40, y_offset + i * 28 + 6, int(timer_width * timer_progress), 8))
-                
-            # Text
-            text = self.font.render(f"{ptype['name']}: {powerup['time_left']:.1f}s", True, WHITE)
-            self.screen.blit(text, (170, y_offset + i * 28))
-        
-        # Controls hint
-        hint = self.font.render("WASD:Move | 1/2:Switch | R:Reload | Q:Medkit | E:Chest | F:Powerup", True, WHITE)
-        self.screen.blit(hint, (12, SCREEN_H - 24))
-        
-        # Current weapon info
-        if self.player.gun:
-            gun_info = self.font.render(f"{self.player.gun.name} | {self.player.mag[self.player.equipped]}/{self.player.gun.mag}", True, WHITE)
-            self.screen.blit(gun_info, (12, SCREEN_H - 48))
+            row_y = y_offset + i * 34
+            self._draw_panel((14, row_y, 268, 28), alpha=205)
+            pygame.draw.circle(self.screen, ptype['color'], (29, row_y + 14), 7)
+            text = self.smallfont.render(ptype['name'].upper(), True, WHITE)
+            self.screen.blit(text, (44, row_y + 6))
+            seconds = self.smallfont.render(f"{powerup['time_left']:.1f}s", True, ptype['color'])
+            self.screen.blit(seconds, (265 - seconds.get_width(), row_y + 6))
+
+        # Weapon dock
+        slot_size, gap = 70, 8
+        dock_w = MAX_WEAPON_SLOTS * slot_size + (MAX_WEAPON_SLOTS - 1) * gap + 24
+        dock_x, dock_y = SCREEN_W // 2 - dock_w // 2, SCREEN_H - 96
+        self._draw_panel((dock_x, dock_y, dock_w, 82))
+        for i in range(MAX_WEAPON_SLOTS):
+            x, y = dock_x + 12 + i * (slot_size + gap), dock_y + 6
+            slot_rect = pygame.Rect(x, y, slot_size, slot_size)
+            pygame.draw.rect(self.screen, PANEL_SOFT, slot_rect, border_radius=9)
+            border = YELLOW if i == self.player.equipped else (69, 87, 94)
+            pygame.draw.rect(self.screen, border, slot_rect, 3 if i == self.player.equipped else 1, border_radius=9)
+            gun = self.player.inventory[i]
+            if gun:
+                if gun.name in self.assets:
+                    img = self.assets[gun.name]
+                    self.screen.blit(img, img.get_rect(center=(slot_rect.centerx, slot_rect.centery - 5)))
+                else:
+                    initial = self.mediumfont.render(gun.name[0], True, WHITE)
+                    self.screen.blit(initial, initial.get_rect(center=(slot_rect.centerx, slot_rect.centery - 5)))
+                ammo = self.smallfont.render(f"{self.player.mag[i]} / {gun.mag}", True, WHITE)
+                self.screen.blit(ammo, (x + 8, y + 49))
+            else:
+                empty = self.smallfont.render("EMPTY", True, GRAY)
+                self.screen.blit(empty, empty.get_rect(center=slot_rect.center))
+            key = self.smallfont.render(str(i + 1), True, border)
+            self.screen.blit(key, (x + slot_size - key.get_width() - 7, y + 5))
+
+        # Controls sit in one readable strip instead of scattered text.
+        hint = self.smallfont.render(
+            "WASD  MOVE   •   SPACE  FIRE   •   E  LOOT   •   R  RELOAD   •   TAB  MAP",
+            True, (210, 220, 216)
+        )
+        hint_rect = pygame.Rect(14, SCREEN_H - 42, hint.get_width() + 24, 28)
+        self._draw_panel(hint_rect, alpha=205)
+        self.screen.blit(hint, (hint_rect.x + 12, hint_rect.y + 6))
+
+        if self.multiplayer and self.net_client:
+            if self.net_client.connected and self.network_spawned:
+                status, color = f"ONLINE  •  {self.network_player_count} PLAYERS", GREEN
+            elif getattr(self.net_client, "last_error", "") == "Reconnecting...":
+                status, color = "RECONNECTING...", YELLOW
+            elif getattr(self.net_client, "last_error", ""):
+                status, color = "CONNECTION LOST", RED
+            else:
+                status, color = "CONNECTING...", YELLOW
+            status_text = self.smallfont.render(status, True, color)
+            status_rect = pygame.Rect(0, 14, status_text.get_width() + 32, 30)
+            status_rect.centerx = SCREEN_W // 2
+            self._draw_panel(status_rect)
+            pygame.draw.circle(self.screen, color, (status_rect.x + 13, status_rect.centery), 4)
+            self.screen.blit(status_text, (status_rect.x + 23, status_rect.y + 7))
+
+    def _draw_panel(self, rect, alpha=225):
+        rect = pygame.Rect(rect)
+        surface = pygame.Surface(rect.size, pygame.SRCALPHA)
+        pygame.draw.rect(surface, (*PANEL, alpha), surface.get_rect(), border_radius=11)
+        pygame.draw.rect(surface, (255, 255, 255, 30), surface.get_rect(), 1, border_radius=11)
+        self.screen.blit(surface, rect.topleft)
 
     def _draw_minimap(self):
         mm_size = (240, 180)
+        panel_x, panel_y = SCREEN_W - mm_size[0] - 26, 14
+        self._draw_panel((panel_x - 6, panel_y, mm_size[0] + 12, mm_size[1] + 38))
+        map_label = self.smallfont.render("TACTICAL MAP   •   TAB TO HIDE", True, (210, 220, 216))
+        self.screen.blit(map_label, (panel_x + 6, panel_y + 8))
         mm_surf = pygame.Surface(mm_size)
-        mm_surf.fill((20,20,20))
+        mm_surf.fill(INK)
         
         scale_x, scale_y = mm_size[0] / MAP_W, mm_size[1] / MAP_H
         
@@ -1032,7 +1344,7 @@ class Game:
         for obs in self.obstacles:
             rect = pygame.Rect(int(obs.x * scale_x), int(obs.y * scale_y), 
                              max(1, int(obs.width * scale_x)), max(1, int(obs.height * scale_y)))
-            pygame.draw.rect(mm_surf, (80,80,80), rect)
+            pygame.draw.rect(mm_surf, (75, 91, 91), rect)
         
         # Draw chests
         for chest in self.chests:
@@ -1051,16 +1363,32 @@ class Game:
             if not bot.dead:
                 x, y = int(bot.x * scale_x), int(bot.y * scale_y)
                 pygame.draw.circle(mm_surf, (200,80,80), (x, y), 2)
+
+        # Other players are larger, outlined markers so they cannot be confused
+        # with loot dots.
+        for rp in self.remote_players.values():
+            if not rp.dead:
+                x, y = int(rp.x * scale_x), int(rp.y * scale_y)
+                pygame.draw.circle(mm_surf, WHITE, (x, y), 5)
+                pygame.draw.circle(mm_surf, rp.color, (x, y), 3)
         
         # Draw player
         px, py = int(self.player.x * scale_x), int(self.player.y * scale_y)
-        pygame.draw.circle(mm_surf, (80,140,220), (px, py), 3)
+        pygame.draw.circle(mm_surf, WHITE, (px, py), 5)
+        pygame.draw.circle(mm_surf, BLUE, (px, py), 3)
+
+        view_rect = pygame.Rect(
+            int(self.camera.x * scale_x), int(self.camera.y * scale_y),
+            max(2, int(SCREEN_W * scale_x)), max(2, int(SCREEN_H * scale_y)),
+        )
+        pygame.draw.rect(mm_surf, (210, 220, 216), view_rect, 1)
         
         # Blit to main screen
-        self.screen.blit(mm_surf, (SCREEN_W - mm_size[0] - 12, 12))
+        self.screen.blit(mm_surf, (panel_x, panel_y + 30))
 
-    def run(self):
+    async def run(self):
         running = True
+        result = "menu"
         while running:
             dt = self.clock.tick(FPS) / 1000.0
             
@@ -1075,121 +1403,176 @@ class Game:
             
             self.update(dt)
             self.draw()
+            # Yield once per frame so the browser can paint and process input.
+            await asyncio.sleep(0)
         
         if self.net_client:
             self.net_client.close()
-        pygame.quit()
+        return result
 
 #Menu Initialization
 class MainMenu:
     def __init__(self):
         pygame.init()
         self.screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
-        pygame.display.set_caption("Zombs v3 - Enhanced")
+        pygame.display.set_caption("ShootOut")
         self.clock = pygame.time.Clock()
-        self.font = pygame.font.SysFont("Consolas", 24)
-        self.big_font = pygame.font.SysFont("Consolas", 48)
+        self.font = pygame.font.SysFont("Arial", 22)
+        self.small_font = pygame.font.SysFont("Arial", 16)
+        self.big_font = pygame.font.SysFont("Arial", 68, bold=True)
         self.choice = 0
+        self.options = ["Singleplayer", "Multiplayer"] if IS_WEB else ["Singleplayer", "Multiplayer", "Quit"]
+        self.multiplayer_status = ""
+        self.network_probe = None
+        if IS_WEB:
+            self.multiplayer_status = "Checking multiplayer server..."
+            self.network_probe = BrowserWebSocketClient(
+                f"probe-{uuid.uuid4().hex[:8]}", "Probe", auto_join=False
+            )
+            self.network_probe.on_message = self._handle_probe_message
+            if not self.network_probe.connect():
+                self.multiplayer_status = (
+                    f"Multiplayer unavailable: {self.network_probe.last_error}"
+                )
+        start_background_music()
+
+    def _handle_probe_message(self, message):
+        if message.get("type") == "pong":
+            self.multiplayer_status = "Multiplayer server ready"
+            self.network_probe.close()
+
+    def _button_rect(self, index):
+        return pygame.Rect(SCREEN_W//2 - 210, 330 + index * 86, 420, 66)
         
-    def run(self):
+    async def run(self):
         while True:
             dt = self.clock.tick(FPS) / 1000.0
+
+            if self.network_probe:
+                self.network_probe.poll()
             
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
-                    pygame.quit()
-                    sys.exit()
+                    return
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_UP:
-                        self.choice = (self.choice - 1) % 3
+                        self.choice = (self.choice - 1) % len(self.options)
                     elif event.key == pygame.K_DOWN:
-                        self.choice = (self.choice + 1) % 3
+                        self.choice = (self.choice + 1) % len(self.options)
                     elif event.key == pygame.K_RETURN:
                         if self.choice == 0:  # Singleplayer
                             game = Game(multiplayer=False)
-                            game.run()
+                            if await game.run() == "quit":
+                                return
                         elif self.choice == 1:  # Multiplayer
                             game = Game(multiplayer=True)
                             if game.connect_to_server():
-                                game.run()
+                                if await game.run() == "quit":
+                                    return
                             else:
                                 print("Failed to connect to server")
                         elif self.choice == 2:  # Quit
-                            pygame.quit()
-                            sys.exit()
+                            return
                 elif event.type == pygame.MOUSEMOTION:
                     mx, my = event.pos
                     # Check which button mouse is over
-                    for i in range(3):
-                        rect = pygame.Rect(SCREEN_W//2 - 150, 300 + i * 80, 300, 60)
+                    for i in range(len(self.options)):
+                        rect = self._button_rect(i)
                         if rect.collidepoint(mx, my):
                             self.choice = i
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     mx, my = event.pos
-                    for i in range(3):
-                        rect = pygame.Rect(SCREEN_W//2 - 150, 300 + i * 80, 300, 60)
+                    for i in range(len(self.options)):
+                        rect = self._button_rect(i)
                         if rect.collidepoint(mx, my):
                             if i == 0:  # Singleplayer
                                 game = Game(multiplayer=False)
-                                game.run()
+                                if await game.run() == "quit":
+                                    return
                             elif i == 1:  # Multiplayer
                                 game = Game(multiplayer=True)
                                 if game.connect_to_server():
-                                    game.run()
+                                    if await game.run() == "quit":
+                                        return
                                 else:
                                     print("Failed to connect to server")
                             elif i == 2:  # Quit
-                                pygame.quit()
-                                sys.exit()
+                                return
                         
             # Draw menu
-            self.screen.fill((40, 60, 80))
+            self.screen.fill((18, 31, 39))
             
-            # Animated background
-            for i in range(50):
-                x = (time.time() * 40 + i * 127) % SCREEN_W
+            # Animated radar-like background texture
+            for i in range(44):
+                x = (time.time() * (12 + i % 4) + i * 127) % (SCREEN_W + 80) - 40
                 y = (i * 71) % SCREEN_H
-                pygame.draw.circle(self.screen, (60, 80, 100), (int(x), int(y)), 3)
+                radius = 2 if i % 3 else 4
+                pygame.draw.circle(self.screen, (37, 64, 68), (int(x), int(y)), radius)
+            pygame.draw.circle(self.screen, (28, 48, 54), (SCREEN_W//2, 360), 390, 2)
+            pygame.draw.circle(self.screen, (28, 48, 54), (SCREEN_W//2, 360), 285, 2)
             
-            # Title
-            title = self.big_font.render("ShootOut™", True, WHITE)
-            self.screen.blit(title, (SCREEN_W//2 - title.get_width()//2, 150))
-            
-            # Subtitle
-            subtitle = self.font.render("Made by Archit Das ©2025", True, RED)
-            self.screen.blit(subtitle, (SCREEN_W//2 - subtitle.get_width()//2, 200))
+            eyebrow = self.small_font.render("TOP-DOWN SURVIVAL • BROWSER EDITION", True, CYAN)
+            self.screen.blit(eyebrow, (SCREEN_W//2 - eyebrow.get_width()//2, 104))
+            title = self.big_font.render("SHOOTOUT", True, WHITE)
+            self.screen.blit(title, (SCREEN_W//2 - title.get_width()//2, 128))
+            subtitle = self.font.render("Fight smart. Loot fast. Be the last one standing.", True, (184, 199, 201))
+            self.screen.blit(subtitle, (SCREEN_W//2 - subtitle.get_width()//2, 210))
+
+            panel = pygame.Surface((500, 292), pygame.SRCALPHA)
+            pygame.draw.rect(panel, (*PANEL, 225), panel.get_rect(), border_radius=22)
+            pygame.draw.rect(panel, (255, 255, 255, 26), panel.get_rect(), 1, border_radius=22)
+            self.screen.blit(panel, (SCREEN_W//2 - 250, 286))
 
             
             # Menu buttons
-            options = ["Singleplayer", "Multiplayer", "Quit"]
-            for i, option in enumerate(options):
-                rect = pygame.Rect(SCREEN_W//2 - 150, 300 + i * 80, 300, 60)
-                color = (100, 150, 200) if i == self.choice else (60, 90, 120)
-                pygame.draw.rect(self.screen, color, rect, border_radius=15)
-                pygame.draw.rect(self.screen, WHITE, rect, 3, border_radius=15)
-                
-                text = self.font.render(option, True, WHITE)
-                text_rect = text.get_rect(center=rect.center)
+            for i, option in enumerate(self.options):
+                rect = self._button_rect(i)
+                selected = i == self.choice
+                color = (58, 104, 124) if selected else PANEL_SOFT
+                border = CYAN if selected else (70, 89, 96)
+                pygame.draw.rect(self.screen, color, rect, border_radius=13)
+                pygame.draw.rect(self.screen, border, rect, 3 if selected else 1, border_radius=13)
+                label = "PLAY SOLO" if option == "Singleplayer" else "JOIN MULTIPLAYER" if option == "Multiplayer" else option.upper()
+                text = self.font.render(label, True, WHITE)
+                text_rect = text.get_rect(midleft=(rect.x + 28, rect.centery))
                 self.screen.blit(text, text_rect)
-            
-            # Instructions
-            instructions = [
-                "Arrow keys or mouse to navigate",
-                "Enter or click to select",
-                "E to Open Chests, F to use powerups, R to Reload, Q to use Medkits",
-                "TAB to toggle minimap, L to Respawn after death",
-                "|LORE|",
-                "In the age before the war, peace was fragile.",
-                "When resources dwindled, chaos took over.",
-                "Now only the brave fight for survival."
+                arrow = self.font.render("→", True, border if not selected else WHITE)
+                self.screen.blit(arrow, arrow.get_rect(midright=(rect.right - 24, rect.centery)))
 
+            if self.multiplayer_status:
+                if self.multiplayer_status.endswith("ready"):
+                    probe_label, probe_color = "SERVER READY", GREEN
+                elif "unavailable" in self.multiplayer_status.lower():
+                    probe_label, probe_color = "SERVER UNAVAILABLE", RED
+                else:
+                    probe_label, probe_color = "CHECKING SERVER", YELLOW
+                probe_text = self.small_font.render(f"●  {probe_label}", True, probe_color)
+                self.screen.blit(
+                    probe_text,
+                    (SCREEN_W//2 - probe_text.get_width()//2, 514),
+                )
+            
+            instructions = [
+                "WASD to move   •   Mouse or Space to fire   •   E to loot chests",
+                "F for powerups   •   R to reload   •   Q for medkits   •   Tab for map",
             ]
 
             for i, instruction in enumerate(instructions):
-                text = self.font.render(instruction, True, (200, 200, 200))
-                self.screen.blit(text, (SCREEN_W//2 - text.get_width()//2, SCREEN_H - 200 + i * 25))
+                text = self.small_font.render(instruction, True, (170, 188, 190))
+                self.screen.blit(text, (SCREEN_W//2 - text.get_width()//2, 624 + i * 28))
+
+            credit = self.small_font.render("ARCHIT DAS  © 2026", True, (94, 119, 125))
+            self.screen.blit(credit, (SCREEN_W//2 - credit.get_width()//2, 735))
             
             pygame.display.flip()
+            await asyncio.sleep(0)
+
+async def main():
+    try:
+        await MainMenu().run()
+    finally:
+        pygame.quit()
+
 
 if __name__ == "__main__":
-    MainMenu().run()
+    asyncio.run(main())
