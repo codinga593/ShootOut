@@ -1,344 +1,312 @@
-#Server Code
+import asyncio
+import json
+import math
+from pathlib import Path
 
-import socket, threading, json, time, random
+from aiohttp import WSMsgType, web
 
-HOST, PORT = "0.0.0.0", 50007
+
+HOST, PORT = "0.0.0.0", 8000
 MAX_PLAYERS = 8
-TICK_RATE = 20  # Server updates per second
 MAP_W, MAP_H = 7000, 4000
 PLAYER_MAX_HP = 100
+SPAWN_RING_RADIUS = 190
+WEB_ROOT = Path(__file__).resolve().parent / "build" / "web"
+
 
 class Player:
-    def __init__(self, player_id, name, conn):
+    def __init__(self, player_id, name, websocket, x, y):
         self.id = player_id
         self.name = name
-        self.conn = conn
-        self.x = MAP_W // 2 + random.randint(-100, 100)
-        self.y = MAP_H // 2 + random.randint(-100, 100)
+        self.websocket = websocket
+        self.x = x
+        self.y = y
         self.angle = 0.0
         self.vx = self.vy = 0.0
         self.hp = PLAYER_MAX_HP
         self.dead = False
-        self.last_update = time.time()
         self.kills = 0
 
-    def to_dict(self):
+    def to_roster_dict(self):
         return {
-            'id': self.id, 'name': self.name, 'x': self.x, 'y': self.y,
-            'angle': self.angle, 'vx': self.vx, 'vy': self.vy,
-            'hp': self.hp, 'dead': self.dead, 'kills': self.kills
+            "id": self.id,
+            "name": self.name,
+            "x": self.x,
+            "y": self.y,
+            "angle": self.angle,
+            "vx": self.vx,
+            "vy": self.vy,
+            "hp": self.hp,
+            "dead": self.dead,
         }
+
 
 class GameServer:
     def __init__(self):
         self.players = {}
-        self.game_started = False
         self.host_id = None
-        self.running = True
-        self.sock = None
+        self.game_started = False
+        self.cleanup_task = None
 
-    def start(self):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind((HOST, PORT))
-        self.sock.listen(MAX_PLAYERS)
+    def next_spawn_point(self):
+        """Return a separated spawn around the clear centre of the map."""
+        radius = SPAWN_RING_RADIUS
+        candidates = []
+        for slot in range(MAX_PLAYERS):
+            angle = slot * (2 * math.pi / MAX_PLAYERS)
+            candidates.append((
+                MAP_W // 2 + round(math.cos(angle) * radius),
+                MAP_H // 2 + round(math.sin(angle) * radius),
+            ))
+        if not self.players:
+            return candidates[0]
+        return max(
+            candidates,
+            key=lambda point: min(
+                math.hypot(point[0] - p.x, point[1] - p.y)
+                for p in self.players.values()
+            ),
+        )
 
-        print(f"Zombs server started on {HOST}:{PORT}")
-        print(f"Max players: {MAX_PLAYERS}")
+    async def start_background_tasks(self, _app):
+        self.cleanup_task = asyncio.create_task(self.cleanup_loop())
 
-        # Start game loop thread
-        threading.Thread(target=self.game_loop, daemon=True).start()
-
-        try:
-            while self.running:
-                try:
-                    conn, addr = self.sock.accept()
-                    print(f"Connection from {addr}")
-                    threading.Thread(target=self.handle_client, args=(conn, addr), daemon=True).start()
-                except OSError:
-                    break
-        except KeyboardInterrupt:
-            print("\nServer shutting down...")
-        finally:
-            self.cleanup()
-
-    def cleanup(self):
-        self.running = False
-        if self.sock:
-            self.sock.close()
-        for player in list(self.players.values()):
+    async def stop_background_tasks(self, _app):
+        if self.cleanup_task:
+            self.cleanup_task.cancel()
             try:
-                player.conn.close()
-            except:
+                await self.cleanup_task
+            except asyncio.CancelledError:
                 pass
+        await asyncio.gather(
+            *(player.websocket.close() for player in list(self.players.values())),
+            return_exceptions=True,
+        )
 
-    def handle_client(self, conn, addr):
-        buffer = ""
+    async def websocket_handler(self, request):
+        websocket = web.WebSocketResponse(heartbeat=20)
+        await websocket.prepare(request)
         player = None
 
         try:
-            while self.running:
-                data = conn.recv(1024).decode('utf-8')
-                if not data:
+            async for incoming in websocket:
+                if incoming.type == WSMsgType.TEXT:
+                    try:
+                        message = json.loads(incoming.data)
+                    except (TypeError, json.JSONDecodeError):
+                        await self.send(websocket, {"type": "error", "message": "Invalid message"})
+                        continue
+                    player = await self.process_message(message, websocket, player)
+                elif incoming.type == WSMsgType.ERROR:
                     break
-
-                buffer += data
-                while '\n' in buffer:
-                    line, buffer = buffer.split('\n', 1)
-                    if line.strip():
-                        try:
-                            msg = json.loads(line)
-                            player = self.process_message(msg, conn, player)
-                        except json.JSONDecodeError:
-                            continue
-                        except Exception as e:
-                            print(f"Error processing message: {e}")
-                            continue
-
-        except Exception as e:
-            print(f"Client {addr} error: {e}")
         finally:
             if player:
-                self.remove_player(player.id)
-            try:
-                conn.close()
-            except:
-                pass
+                await self.remove_player(player.id)
 
-    def process_message(self, msg, conn, player):
-        msg_type = msg.get('type')
+        return websocket
 
-        if msg_type == 'join':
-            player_id = msg.get('id')
-            name = msg.get('name', 'Player')
+    async def process_message(self, message, websocket, player):
+        message_type = message.get("type")
 
-            if len(self.players) >= MAX_PLAYERS:
-                self.send_to_client(conn, {'type': 'error', 'message': 'Server full'})
-                return None
-
-            player = Player(player_id, name, conn)
-            self.players[player_id] = player
-
-            # Set first player as host
-            if not self.host_id:
-                self.host_id = player_id
-                print(f"Player {name} ({player_id}) is now host")
-
-            print(f"Player {name} ({player_id}) joined. Players: {len(self.players)}")
-
-            # Send roster to new player
-            roster = [{'id': p.id, 'name': p.name} for p in self.players.values()]
-            self.send_to_client(conn, {'type': 'roster', 'players': roster})
-
-            # Notify others of new player
-            join_msg = {'type': 'join', 'id': player_id, 'name': name}
-            self.broadcast_except(join_msg, player_id)
-
+        if message_type == "ping":
+            await self.send(websocket, {"type": "pong"})
+            print("WebSocket browser probe passed")
             return player
 
-        elif msg_type == 'leave':
-            if player:
-                self.remove_player(player.id)
+        if message_type == "join":
+            player_id = str(message.get("id", ""))[:64]
+            name = str(message.get("name", "Player"))[:24]
+            if not player_id:
+                await self.send(websocket, {"type": "error", "message": "Missing player id"})
+                return None
+            if len(self.players) >= MAX_PLAYERS and player_id not in self.players:
+                await self.send(websocket, {"type": "error", "message": "Server full"})
+                await websocket.close()
+                return None
+            if player_id in self.players:
+                await self.remove_player(player_id)
+
+            spawn_x, spawn_y = self.next_spawn_point()
+            player = Player(player_id, name, websocket, spawn_x, spawn_y)
+            self.players[player_id] = player
+            if not self.host_id:
+                self.host_id = player_id
+            self.game_started = True
+
+            # Send the complete authoritative roster to everyone. This makes
+            # existing and newly-opened browser tabs converge to the same view.
+            await self.broadcast(
+                {
+                    "type": "roster",
+                    "players": [p.to_roster_dict() for p in self.players.values()],
+                    "host_id": self.host_id,
+                }
+            )
+            await self.broadcast({"type": "start", "players": len(self.players)})
+            print(f"Player {name} ({player_id}) joined via WebSocket")
+            return player
+
+        if not player:
+            await self.send(websocket, {"type": "error", "message": "Join first"})
             return None
 
-        elif msg_type == 'state' and player:
-            # Update player state
-            player.x = msg.get('x', player.x)
-            player.y = msg.get('y', player.y)
-            player.angle = msg.get('angle', player.angle)
-            player.vx = msg.get('vx', player.vx)
-            player.vy = msg.get('vy', player.vy)
-            player.hp = msg.get('hp', player.hp)
-            player.last_update = time.time()
+        if message_type == "leave":
+            await self.remove_player(player.id)
+            return None
 
-            # Broadcast state to others
-            state_msg = {
-                'type': 'state', 'id': player.id,
-                'x': player.x, 'y': player.y, 'angle': player.angle,
-                'vx': player.vx, 'vy': player.vy, 'hp': player.hp
-            }
-            self.broadcast_except(state_msg, player.id)
+        if message_type == "state":
+            player.x = message.get("x", player.x)
+            player.y = message.get("y", player.y)
+            player.angle = message.get("angle", player.angle)
+            player.vx = message.get("vx", player.vx)
+            player.vy = message.get("vy", player.vy)
+            player.hp = message.get("hp", player.hp)
+            await self.broadcast_except(
+                {
+                    "type": "state",
+                    "id": player.id,
+                    "x": player.x,
+                    "y": player.y,
+                    "angle": player.angle,
+                    "vx": player.vx,
+                    "vy": player.vy,
+                    "hp": player.hp,
+                },
+                player.id,
+            )
 
-        elif msg_type == 'start' and player and player.id == self.host_id:
-            if not self.game_started and len(self.players) > 0:
-                self.start_game()
+        elif message_type == "shoot":
+            await self.broadcast_except(
+                {
+                    "type": "shoot",
+                    "id": player.id,
+                    "x": message.get("x", 0),
+                    "y": message.get("y", 0),
+                    "vx": message.get("vx", 0),
+                    "vy": message.get("vy", 0),
+                    "dmg": message.get("dmg", 15),
+                },
+                player.id,
+            )
 
-        elif msg_type == 'shoot' and player:
-            # Relay bullet to all players (render-only on clients)
-            bullet_msg = {
-                'type': 'shoot', 'id': player.id,
-                'x': msg.get('x', 0), 'y': msg.get('y', 0),
-                'vx': msg.get('vx', 0), 'vy': msg.get('vy', 0),
-                'dmg': msg.get('dmg', 15)
-            }
-            self.broadcast_except(bullet_msg, player.id)
+        elif message_type in {"chest_open", "powerup_collect", "medkit_use"}:
+            await self.broadcast_except({**message, "id": player.id}, player.id)
 
-        elif msg_type == 'chest_open' and player and self.game_started:
-            # Relay chest opening to all players
-            chest_msg = {
-                'type': 'chest_open', 'id': player.id,
-                'cx': msg.get('cx'), 'cy': msg.get('cy'),
-                'contents': msg.get('contents')
-            }
-            self.broadcast_except(chest_msg, player.id)
-
-        elif msg_type == 'powerup_collect' and player and self.game_started:
-            # Relay powerup collection to all players
-            powerup_msg = {
-                'type': 'powerup_collect', 'id': player.id,
-                'px': msg.get('px'), 'py': msg.get('py'),
-                'ptype': msg.get('ptype')
-            }
-            self.broadcast_except(powerup_msg, player.id)
-
-        elif msg_type == 'medkit_use' and player and self.game_started:
-            # Relay medkit use to all players
-            medkit_msg = {'type': 'medkit_use', 'id': player.id}
-            self.broadcast_except(medkit_msg, player.id)
-
-        elif msg_type == 'dead' and player and self.game_started:
+        elif message_type == "dead":
             player.dead = True
-            dead_msg = {'type': 'dead', 'id': player.id}
-            self.broadcast_except(dead_msg, player.id)
+            await self.broadcast({"type": "dead", "id": player.id})
 
-        elif msg_type == 'respawn' and player:
-            player.x = msg.get('x', MAP_W // 2)
-            player.y = msg.get('y', MAP_H // 2)
-            player.hp = msg.get('hp', PLAYER_MAX_HP)
+        elif message_type == "respawn":
+            player.x = message.get("x", MAP_W // 2)
+            player.y = message.get("y", MAP_H // 2)
+            player.hp = PLAYER_MAX_HP
             player.dead = False
+            await self.broadcast(
+                {
+                    "type": "respawn",
+                    "id": player.id,
+                    "x": player.x,
+                    "y": player.y,
+                    "hp": player.hp,
+                }
+            )
 
-            respawn_msg = {
-                'type': 'respawn', 'id': player.id,
-                'x': player.x, 'y': player.y, 'hp': player.hp
-            }
-            # Inform everyone else, and also echo back to the requester in case client-side suppressed local spawn UI
-            self.broadcast_except(respawn_msg, player.id)
-            self.send_to_client(player.conn, respawn_msg)
-
-        elif msg_type == 'hit' and player:
-            target_id = msg.get('target_id')
-            dmg = int(msg.get('dmg', 15))
-            if target_id and target_id in self.players:
-                target = self.players[target_id]
-                if not target.dead:
-                    target.hp = max(0, target.hp - dmg)
-                    if target.hp <= 0:
-                        target.dead = True
-                        # announce death
-                        dead_msg = {'type': 'dead', 'id': target.id}
-                        self.broadcast(dead_msg)
-                    else:
-                        # hp update for target
-                        hp_msg = {'type': 'hp', 'id': target.id, 'hp': target.hp}
-                        self.broadcast(hp_msg)
+        elif message_type == "hit":
+            target = self.players.get(message.get("target_id"))
+            if target and not target.dead:
+                damage = max(0, min(500, int(message.get("dmg", 15))))
+                target.hp = max(0, target.hp - damage)
+                if target.hp == 0:
+                    target.dead = True
+                    player.kills += 1
+                    await self.broadcast({"type": "dead", "id": target.id})
+                else:
+                    await self.broadcast({"type": "hp", "id": target.id, "hp": target.hp})
 
         return player
 
-    def start_game(self):
-        self.game_started = True
-        print(f"Game started with {len(self.players)} players")
-
-        # Reset all players
-        for player in self.players.values():
-            player.hp = PLAYER_MAX_HP
-            player.dead = False
-            player.kills = 0
-            player.x = MAP_W // 2 + random.randint(-200, 200)
-            player.y = MAP_H // 2 + random.randint(-200, 200)
-
-        start_msg = {'type': 'start', 'players': len(self.players)}
-        self.broadcast(start_msg)
-
-    def remove_player(self, player_id):
-        if player_id in self.players:
-            player = self.players[player_id]
-            del self.players[player_id]
-
-            print(f"Player {player.name} ({player_id}) left. Players: {len(self.players)}")
-
-            # If host left, assign new host
-            if self.host_id == player_id:
-                if self.players:
-                    self.host_id = next(iter(self.players))
-                    print(f"New host: {self.players[self.host_id].name}")
-                else:
-                    self.host_id = None
-                    self.game_started = False
-
-            # Notify others
-            leave_msg = {'type': 'leave', 'id': player_id}
-            self.broadcast(leave_msg)
-
-    def send_to_client(self, conn, msg):
-        try:
-            data = json.dumps(msg) + '\n'
-            conn.sendall(data.encode('utf-8'))
-        except:
-            pass
-
-    def broadcast(self, msg):
-        for player in list(self.players.values()):
-            self.send_to_client(player.conn, msg)
-
-    def broadcast_except(self, msg, except_id):
-        for player in list(self.players.values()):
-            if player.id != except_id:
-                self.send_to_client(player.conn, msg)
-
-    def game_loop(self):
-        last_time = time.time()
-
-        while self.running:
-            current_time = time.time()
-            dt = current_time - last_time
-
-            if dt >= 1.0 / TICK_RATE:
-                self.update_game(dt)
-                last_time = current_time
-
-            time.sleep(0.01)  # Prevent busy waiting
-
-    def update_game(self, dt):
-        if not self.game_started:
+    async def remove_player(self, player_id):
+        player = self.players.pop(player_id, None)
+        if not player:
             return
+        if self.host_id == player_id:
+            self.host_id = next(iter(self.players), None)
+        if not self.players:
+            self.game_started = False
+        await self.broadcast({"type": "leave", "id": player_id, "host_id": self.host_id})
+        print(f"Player {player.name} ({player_id}) left")
 
-        # Remove disconnected players (no updates for 10 seconds)
-        current_time = time.time()
-        disconnected = []
+    async def send(self, websocket, message):
+        if not websocket.closed:
+            try:
+                await websocket.send_str(json.dumps(message))
+            except (ConnectionError, RuntimeError):
+                pass
 
-        for player_id, player in self.players.items():
-            if current_time - player.last_update > 10.0:
-                disconnected.append(player_id)
+    async def broadcast(self, message):
+        await asyncio.gather(
+            *(self.send(player.websocket, message) for player in list(self.players.values())),
+            return_exceptions=True,
+        )
 
-        for player_id in disconnected:
-            print(f"Player {player_id} timed out")
-            self.remove_player(player_id)
+    async def broadcast_except(self, message, excluded_id):
+        await asyncio.gather(
+            *(
+                self.send(player.websocket, message)
+                for player in list(self.players.values())
+                if player.id != excluded_id
+            ),
+            return_exceptions=True,
+        )
 
-        # Check win conditions (if needed)
-        alive_players = [p for p in self.players.values() if not p.dead]
-        if len(alive_players) <= 1 and len(self.players) > 1:
-            # Game over logic could go here
-            pass
+    async def cleanup_loop(self):
+        while True:
+            await asyncio.sleep(15)
+            stale_ids = [
+                player.id
+                for player in self.players.values()
+                if player.websocket.closed
+            ]
+            for player_id in stale_ids:
+                await self.remove_player(player_id)
 
-    def get_status(self):
-        return {
-            'players': len(self.players),
-            'max_players': MAX_PLAYERS,
-            'game_started': self.game_started,
-            'host': self.host_id
-        }
+    async def status_handler(self, _request):
+        return web.json_response(
+            {
+                "players": len(self.players),
+                "max_players": MAX_PLAYERS,
+                "game_started": self.game_started,
+                "host": self.host_id,
+            }
+        )
+
+
+async def index_handler(_request):
+    index = WEB_ROOT / "index.html"
+    if not index.exists():
+        raise web.HTTPServiceUnavailable(text="Run ./build_web.sh first")
+    return web.FileResponse(index)
+
+
+def create_app():
+    server = GameServer()
+    app = web.Application()
+    app["game_server"] = server
+    app.on_startup.append(server.start_background_tasks)
+    app.on_cleanup.append(server.stop_background_tasks)
+    app.router.add_get("/ws", server.websocket_handler)
+    app.router.add_get("/api/status", server.status_handler)
+    app.router.add_get("/", index_handler)
+    if WEB_ROOT.exists():
+        app.router.add_static("/", WEB_ROOT, show_index=False)
+    return app
+
 
 def main():
-    print("Zombs Game Server v1.0")
-    print("Press Ctrl+C to stop")
+    print(f"ShootOut web server: http://localhost:{PORT}")
+    print(f"WebSocket multiplayer: ws://localhost:{PORT}/ws")
+    web.run_app(create_app(), host=HOST, port=PORT)
 
-    server = GameServer()
-    try:
-        server.start()
-    except KeyboardInterrupt:
-        print("\nShutting down server...")
-    finally:
-        server.cleanup()
 
 if __name__ == "__main__":
     main()
